@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -27,6 +28,19 @@ func showImage(imagePath string) error {
 	return cmd.Run()
 }
 
+func isValidImagePath(imagePath string) bool {
+	absPath, err := filepath.Abs(imagePath)
+	if err != nil {
+		log.Printf("Erro ao resolver caminho absoluto para %s: %v", imagePath, err)
+		return false
+	}
+	if _, err := os.Stat(absPath); os.IsNotExist(err) {
+		log.Printf("Caminho da imagem não existe: %s", absPath)
+		return false
+	}
+	return true
+}
+
 func startSlideshow(transitionTime int) {
 	for {
 		imageMutex.Lock()
@@ -34,6 +48,10 @@ func startSlideshow(transitionTime int) {
 			imageMutex.Unlock()
 			time.Sleep(1 * time.Second)
 			continue
+		}
+
+		if currentIndex >= len(imageList) {
+			currentIndex = 0
 		}
 
 		currentImage := imageList[currentIndex]
@@ -63,14 +81,22 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Payload recebido: %+v", payload)
+
 	imageMutex.Lock()
-	imageList = append(imageList, payload.Images...)
+	for _, imagePath := range payload.Images {
+		if isValidImagePath(imagePath) {
+			imageList = append(imageList, imagePath)
+		} else {
+			log.Printf("Imagem inválida ignorada: %s", imagePath)
+		}
+	}
 	if currentIndex >= len(imageList) {
 		currentIndex = 0
 	}
 	imageMutex.Unlock()
 
-	log.Printf("Novas imagens adicionadas: %v", payload.Images)
+	log.Printf("Lista de imagens atualizada: %v", imageList)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Imagens adicionadas com sucesso!"))
 }
