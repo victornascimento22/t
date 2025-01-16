@@ -14,8 +14,9 @@ import (
 )
 
 type ScreenPayload struct {
-	Images         []string `json:"images"`          // Lista de URLs base64
-	TransitionTime int      `json:"transition_time"` // Tempo de transição entre imagens
+	Image          string `json:"image"`
+	Index          int    `json:"index"`
+	TransitionTime int    `json:"transition_time"`
 }
 
 const (
@@ -24,171 +25,141 @@ const (
 )
 
 var (
-	images       []string // Lista de imagens salvas
+	imageList    []string
 	imageMutex   sync.Mutex
 	currentIndex int
-	transition   int = 3 // Tempo de transição padrão em segundos
+	isRunning    bool
 )
 
-// Limpa o diretório de imagens antigas
 func cleanImageFolder() {
 	files, err := filepath.Glob(filepath.Join(ImageFolder, "screen_*.png"))
 	if err != nil {
-		log.Printf("Erro ao listar imagens no diretório: %v", err)
+		log.Printf("Erro ao listar imagens: %v", err)
 		return
 	}
 
 	for _, file := range files {
-		err := os.Remove(file)
-		if err != nil {
-			log.Printf("Erro ao remover imagem %s: %v", file, err)
-		} else {
-			log.Printf("Imagem removida: %s", file)
+		if err := os.Remove(file); err != nil {
+			log.Printf("Erro ao remover arquivo %s: %v", file, err)
 		}
 	}
+
+	imageList = []string{} // Limpa a lista de imagens
+	currentIndex = 0
 }
 
-// Salva as novas imagens no diretório e atualiza a lista
-func saveImages(imageDataList []string) error {
+func saveImage(index int, imageData []byte) (string, error) {
+	imagePath := filepath.Join(ImageFolder, fmt.Sprintf("screen_%d.png", index))
+
+	if err := os.WriteFile(imagePath, imageData, 0644); err != nil {
+		return "", fmt.Errorf("erro ao salvar imagem: %v", err)
+	}
+
 	imageMutex.Lock()
 	defer imageMutex.Unlock()
 
-	// Limpa imagens existentes
-	cleanImageFolder()
-	images = nil
-
-	// Salva cada imagem individualmente
-	for i, imageData := range imageDataList {
-		imageBytes, err := base64.StdEncoding.DecodeString(imageData)
-		if err != nil {
-			log.Printf("Erro ao decodificar imagem %d: %v", i, err)
-			return fmt.Errorf("erro ao decodificar imagem: %w", err)
+	// Verifica se a imagem ja existe na lista
+	for _, img := range imageList {
+		if img == imagePath {
+			return imagePath, nil
 		}
-
-		imagePath := filepath.Join(ImageFolder, fmt.Sprintf("screen_%d.png", i))
-		err = os.WriteFile(imagePath, imageBytes, 0644)
-		if err != nil {
-			log.Printf("Erro ao salvar imagem %d: %v", i, err)
-			return fmt.Errorf("erro ao salvar imagem: %w", err)
-		}
-
-		// Adiciona à lista de imagens
-		images = append(images, imagePath)
-		log.Printf("Imagem salva: %s", imagePath)
 	}
 
-	return nil
+	// Adiciona nova imagem a lista
+	imageList = append(imageList, imagePath)
+	log.Printf("Nova imagem adicionada: %s. Total: %d", imagePath, len(imageList))
+
+	return imagePath, nil
 }
 
-// Loop contínuo para exibir imagens em sequência
-func startSlideshow() {
-	for {
-		imageMutex.Lock()
-		if len(images) == 0 {
-			imageMutex.Unlock()
-			time.Sleep(1 * time.Second) // Aguarda se não houver imagens
-			continue
-		}
-
-		// Seleciona a imagem atual
-		image := images[currentIndex]
-		imageMutex.Unlock()
-
-		// Exibe a imagem
-		showImage(image)
-
-		// Atualiza o índice para a próxima imagem
-		imageMutex.Lock()
-		currentIndex = (currentIndex + 1) % len(images)
-		imageMutex.Unlock()
-
-		// Aguarda o tempo de transição
-		time.Sleep(time.Duration(transition) * time.Second)
-	}
-}
-
-// Exibe a imagem com o comando feh em tela cheia
-func showImage(imagePath string) {
-	log.Printf("Exibindo imagem: %s", imagePath)
-
-	cmd := []string{
-		"feh",
-		"--fullscreen",   // Ativa o modo tela cheia
-		"--hide-pointer", // Esconde o cursor do mouse
-		"--force-aliasing",
-		"--zoom", "fill",
-		"--high-quality",
-		"--scale-down",
-		"--no-info", // Não exibe informações na tela
+func showImage(imagePath string) error {
+	cmd := exec.Command("feh",
+		"-F",               // Tela cheia
+		"--hide-pointer",   // Esconde cursor
+		"--force-aliasing", // Melhor qualidade
+		"--zoom", "fill",   // Preenche tela
+		"--high-quality", // Alta qualidade
+		"--scale-down",   // Ajusta escala
+		"--borderless",   // Sem bordas
+		"--no-menus",     // Sem menus
+		"--quiet",        // Sem logs
 		imagePath,
-	}
+	)
 
-	err := executeCommand("feh", cmd...)
-	if err != nil {
-		log.Printf("Erro ao exibir imagem %s: %v", imagePath, err)
-	}
-}
-
-// Executa comandos do sistema
-func executeCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
 	cmd.Env = append(os.Environ(), "DISPLAY=:0")
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("erro ao executar comando %s: %w", name, err)
-	}
-	return nil
+	return cmd.Run()
 }
 
-// Manipula as solicitações recebidas no webhook
-func handleWebhook(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Recebendo payload de %s", r.RemoteAddr)
+func startSlideshow() {
+	if isRunning {
+		return
+	}
 
+	isRunning = true
+
+	go func() {
+		for {
+			imageMutex.Lock()
+			if len(imageList) == 0 {
+				imageMutex.Unlock()
+				time.Sleep(time.Second)
+				continue
+			}
+
+			// Pega imagem atual
+			currentImage := imageList[currentIndex]
+			imageMutex.Unlock()
+
+			// Exibe imagem
+			if err := showImage(currentImage); err != nil {
+				log.Printf("Erro ao exibir imagem %s: %v", currentImage, err)
+				time.Sleep(time.Second)
+				continue
+			}
+
+			imageMutex.Lock()
+			// Avanca para proxima imagem
+			currentIndex = (currentIndex + 1) % len(imageList)
+			imageMutex.Unlock()
+
+			// Aguarda antes da proxima imagem
+			time.Sleep(5 * time.Second)
+		}
+	}()
+}
+
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	var payload ScreenPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		log.Printf("Erro ao decodificar JSON: %v", err)
 		http.Error(w, "Erro ao ler payload", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Payload recebido: imagens=%d, transicao=%ds",
-		len(payload.Images),
-		payload.TransitionTime,
-	)
-
-	// Atualiza o tempo de transição se fornecido
-	if payload.TransitionTime > 0 {
-		transition = payload.TransitionTime
+	imageBytes, err := base64.StdEncoding.DecodeString(payload.Image)
+	if err != nil {
+		http.Error(w, "Erro ao decodificar imagem", http.StatusBadRequest)
+		return
 	}
 
-	// Salva as imagens no diretório
-	err := saveImages(payload.Images)
+	imagePath, err := saveImage(payload.Index, imageBytes)
 	if err != nil {
-		log.Printf("Erro ao salvar imagens: %v", err)
-		http.Error(w, "Erro ao salvar imagens", http.StatusInternalServerError)
+		http.Error(w, "Erro ao salvar imagem", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Imagens recebidas e salvas com sucesso")
+	fmt.Fprintf(w, "Imagem %d salva: %s", payload.Index, imagePath)
 }
 
 func main() {
-	// Limpa o diretório ao iniciar o programa
-	cleanImageFolder()
-
-	// Garante que o diretório existe
-	if _, err := os.Stat(ImageFolder); os.IsNotExist(err) {
-		err := os.MkdirAll(ImageFolder, 0755)
-		if err != nil {
-			log.Fatalf("Erro ao criar diretório %s: %v", ImageFolder, err)
-		}
+	if err := os.MkdirAll(ImageFolder, 0755); err != nil {
+		log.Fatalf("Erro ao criar diretorio: %v", err)
 	}
 
-	// Inicia o slideshow em um goroutine separado
-	go startSlideshow()
+	cleanImageFolder()
+	startSlideshow()
 
 	http.HandleFunc("/webhook", handleWebhook)
-	log.Printf("Servidor rodando em http://localhost:%s\n", PORT)
+	log.Printf("Servidor rodando na porta %s", PORT)
 	log.Fatal(http.ListenAndServe(":"+PORT, nil))
 }
