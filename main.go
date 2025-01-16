@@ -1,119 +1,165 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 )
 
-type Payload struct {
-	Images         []string `json:"images"`
-	TransitionTime int      `json:"transitionTime"`
+type ScreenPayload struct {
+	Image          string `json:"image"`
+	Index          int    `json:"index"`
+	TransitionTime int    `json:"transition_time"`
 }
+
+const (
+	PORT        = "8081"
+	ImageFolder = "/tmp/screenshots"
+)
 
 var (
 	imageList    []string
 	imageMutex   sync.Mutex
 	currentIndex int
+	isRunning    bool
 )
 
+func cleanImageFolder() {
+	files, err := filepath.Glob(filepath.Join(ImageFolder, "screen_*.png"))
+	if err != nil {
+		log.Printf("Erro ao listar imagens: %v", err)
+		return
+	}
+
+	for _, file := range files {
+		if err := os.Remove(file); err != nil {
+			log.Printf("Erro ao remover arquivo %s: %v", file, err)
+		}
+	}
+
+	imageList = []string{} // Limpa a lista de imagens
+	currentIndex = 0
+}
+
+func saveImage(index int, imageData []byte) (string, error) {
+	imagePath := filepath.Join(ImageFolder, fmt.Sprintf("screen_%d.png", index))
+
+	if err := os.WriteFile(imagePath, imageData, 0644); err != nil {
+		return "", fmt.Errorf("erro ao salvar imagem: %v", err)
+	}
+
+	imageMutex.Lock()
+	defer imageMutex.Unlock()
+
+	// Verifica se a imagem ja existe na lista
+	for _, img := range imageList {
+		if img == imagePath {
+			return imagePath, nil
+		}
+	}
+
+	// Adiciona nova imagem a lista
+	imageList = append(imageList, imagePath)
+	log.Printf("Nova imagem adicionada: %s. Total: %d", imagePath, len(imageList))
+
+	return imagePath, nil
+}
+
 func showImage(imagePath string) error {
-	cmd := exec.Command("feh", "--fullscreen", imagePath)
+	cmd := exec.Command("feh",
+		"-F",               // Tela cheia
+		"--hide-pointer",   // Esconde cursor
+		"--force-aliasing", // Melhor qualidade
+		"--zoom", "fill",   // Preenche tela
+		"--high-quality", // Alta qualidade
+		"--scale-down",   // Ajusta escala
+		"--borderless",   // Sem bordas
+		"--no-menus",     // Sem menus
+		"--quiet",        // Sem logs
+		imagePath,
+	)
+
+	cmd.Env = append(os.Environ(), "DISPLAY=:0")
 	return cmd.Run()
 }
 
-func isValidImagePath(imagePath string) bool {
-	absPath, err := filepath.Abs(imagePath)
-	if err != nil {
-		log.Printf("Erro ao resolver caminho absoluto para %s: %v", imagePath, err)
-		return false
+func startSlideshow() {
+	if isRunning {
+		return
 	}
-	if _, err := os.Stat(absPath); os.IsNotExist(err) {
-		log.Printf("Caminho da imagem não existe: %s", absPath)
-		return false
-	}
-	return true
-}
 
-func startSlideshow(transitionTime int) {
-	for {
-		imageMutex.Lock()
-		if len(imageList) == 0 {
+	isRunning = true
+
+	go func() {
+		for {
+			imageMutex.Lock()
+			if len(imageList) == 0 {
+				imageMutex.Unlock()
+				time.Sleep(time.Second)
+				continue
+			}
+
+			// Pega imagem atual
+			currentImage := imageList[currentIndex]
 			imageMutex.Unlock()
-			time.Sleep(1 * time.Second)
-			continue
+
+			// Exibe imagem
+			if err := showImage(currentImage); err != nil {
+				log.Printf("Erro ao exibir imagem %s: %v", currentImage, err)
+				time.Sleep(time.Second)
+				continue
+			}
+
+			imageMutex.Lock()
+			// Avanca para proxima imagem
+			currentIndex = (currentIndex + 1) % len(imageList)
+			imageMutex.Unlock()
+
+			// Aguarda antes da proxima imagem
+			time.Sleep(5 * time.Second)
 		}
-
-		if currentIndex >= len(imageList) {
-			currentIndex = 0
-		}
-
-		currentImage := imageList[currentIndex]
-		log.Printf("Exibindo imagem %d: %s", currentIndex, currentImage)
-
-		if err := showImage(currentImage); err != nil {
-			log.Printf("Erro ao exibir imagem %s: %v", currentImage, err)
-		}
-
-		currentIndex = (currentIndex + 1) % len(imageList)
-		imageMutex.Unlock()
-
-		time.Sleep(time.Duration(transitionTime) * time.Second)
-	}
+	}()
 }
 
-func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var payload Payload
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	var payload ScreenPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Erro ao decodificar payload", http.StatusBadRequest)
-		log.Printf("Erro ao decodificar payload: %v", err)
+		http.Error(w, "Erro ao ler payload", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Payload recebido: %+v", payload)
-
-	imageMutex.Lock()
-	for _, imagePath := range payload.Images {
-		if isValidImagePath(imagePath) {
-			imageList = append(imageList, imagePath)
-		} else {
-			log.Printf("Imagem inválida ignorada: %s", imagePath)
-		}
+	imageBytes, err := base64.StdEncoding.DecodeString(payload.Image)
+	if err != nil {
+		http.Error(w, "Erro ao decodificar imagem", http.StatusBadRequest)
+		return
 	}
-	if currentIndex >= len(imageList) {
-		currentIndex = 0
-	}
-	imageMutex.Unlock()
 
-	log.Printf("Lista de imagens atualizada: %v", imageList)
+	imagePath, err := saveImage(payload.Index, imageBytes)
+	if err != nil {
+		http.Error(w, "Erro ao salvar imagem", http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Imagens adicionadas com sucesso!"))
+	fmt.Fprintf(w, "Imagem %d salva: %s", payload.Index, imagePath)
 }
 
 func main() {
-	transitionTime := 5 // Default transition time in seconds
-	if len(os.Args) > 1 {
-		if customTime, err := strconv.Atoi(os.Args[1]); err == nil {
-			transitionTime = customTime
-		}
+	if err := os.MkdirAll(ImageFolder, 0755); err != nil {
+		log.Fatalf("Erro ao criar diretorio: %v", err)
 	}
 
-	go startSlideshow(transitionTime)
+	cleanImageFolder()
+	startSlideshow()
 
-	http.HandleFunc("/webhook", webhookHandler)
-	log.Println("Servidor iniciado na porta 8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("Erro ao iniciar servidor: %v", err)
-	}
+	http.HandleFunc("/webhook", handleWebhook)
+	log.Printf("Servidor rodando na porta %s", PORT)
+	log.Fatal(http.ListenAndServe(":"+PORT, nil))
 }
