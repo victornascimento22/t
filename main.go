@@ -25,28 +25,27 @@ var (
 	imagemagickMutex sync.Mutex
 	fehCmd           *exec.Cmd
 	fehMutex         sync.Mutex
-	imagePaths       []string
-	imageDir         = "./images"
 )
 
-// initFeh inicia o feh em modo slideshow com as imagens salvas
-func initFeh(transitionTime int) error {
+// initFeh inicia o feh em modo slideshow
+func initFeh() error {
 	fehMutex.Lock()
 	defer fehMutex.Unlock()
 
 	// Mata qualquer instância existente do feh
-	exec.Command("pkill", "feh").Run()
-
-	// Inicia o feh com as imagens salvas
-	args := []string{
-		"-R", "1", // Recarrega a cada 1 segundo
-		"-F",                                    // Modo tela cheia
-		"-Z",                                    // Zoom automático
-		"-D", fmt.Sprintf("%d", transitionTime), // Delay baseado no tempo enviado
-		"-Y",     // Esconde o cursor do mouse
-		imageDir, // Diretório das imagens
+	if err := exec.Command("pkill", "feh").Run(); err != nil {
+		log.Printf("Erro ao matar instância do feh: %v", err)
 	}
-	fehCmd = exec.Command("feh", args...)
+
+	// Inicia o feh em modo slideshow
+	fehCmd = exec.Command("feh",
+		"-R", "1", // Recarrega a cada 1 segundo
+		"-F",      // Modo tela cheia
+		"-Z",      // Zoom automático
+		"-D", "5", // Delay padrão de 5 segundos
+		"-Y", // Esconde o cursor do mouse
+		"./", // Diretório atual
+	)
 
 	if err := fehCmd.Start(); err != nil {
 		return fmt.Errorf("erro ao iniciar feh: %v", err)
@@ -55,22 +54,6 @@ func initFeh(transitionTime int) error {
 	return nil
 }
 
-// cleanUpImages remove todas as imagens salvas
-func cleanUpImages() error {
-	files, err := ioutil.ReadDir(imageDir)
-	if err != nil {
-		return fmt.Errorf("erro ao ler diretório de imagens: %v", err)
-	}
-	for _, file := range files {
-		if err := os.Remove(fmt.Sprintf("%s/%s", imageDir, file.Name())); err != nil {
-			return fmt.Errorf("erro ao remover arquivo %s: %v", file.Name(), err)
-		}
-	}
-	imagePaths = nil
-	return nil
-}
-
-// adjustImage ajusta a imagem recebida (trim, redimensionamento, etc.)
 func adjustImage(imageData []byte) ([]byte, error) {
 	imagemagickMutex.Lock()
 	defer imagemagickMutex.Unlock()
@@ -121,7 +104,6 @@ func adjustImage(imageData []byte) ([]byte, error) {
 	return adjustedImage, nil
 }
 
-// handleWebhook lida com o webhook recebido, ajustando e salvando as imagens
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Recebendo screenshot de %s", r.RemoteAddr)
 
@@ -151,54 +133,36 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outputPath := fmt.Sprintf("%s/output-%d.png", imageDir, payload.Index)
+	outputPath := fmt.Sprintf("output-%d.png", payload.Index)
 	if err := ioutil.WriteFile(outputPath, adjustedImage, 0644); err != nil {
 		log.Printf("Erro ao salvar imagem ajustada: %v", err)
 		http.Error(w, "Erro ao salvar imagem ajustada", http.StatusInternalServerError)
 		return
 	}
 
-	imagePaths = append(imagePaths, outputPath)
 	log.Printf("Imagem ajustada salva em: %s", outputPath)
-
-	// Atualiza o slideshow do feh com o novo tempo de transição
-	if err := initFeh(payload.TransitionTime); err != nil {
-		log.Printf("Erro ao reiniciar feh: %v", err)
-	}
-
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Screenshot %d recebida, ajustada e salva com sucesso", payload.Index)
 }
 
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	// Verifica se a aplicação está rodando (retorna true para online)
+	// Retorne false para offline se a aplicação não estiver rodando
+	isOnline := true // Ou false, dependendo do status da aplicação
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"online": isOnline})
+}
+
 func main() {
-	// Cria o diretório de imagens, se não existir
-	if err := os.MkdirAll(imageDir, 0755); err != nil {
-		log.Fatalf("Erro ao criar diretório de imagens: %v", err)
-	}
-
-	// Limpa imagens antigas ao iniciar
-	if err := cleanUpImages(); err != nil {
-		log.Fatalf("Erro ao limpar imagens antigas: %v", err)
-	}
-
 	// Inicia o feh antes de começar o servidor
-	if err := initFeh(5); err != nil {
+	if err := initFeh(); err != nil {
 		log.Fatal(err)
 	}
 
-	// Configura um handler para finalizar o feh e limpar imagens ao fechar
-	defer func() {
-		fehMutex.Lock()
-		if fehCmd != nil {
-			fehCmd.Process.Kill()
-		}
-		fehMutex.Unlock()
-		if err := cleanUpImages(); err != nil {
-			log.Printf("Erro ao limpar imagens na saída: %v", err)
-		}
-	}()
-
+	// Define o handler para o webhook e status
 	http.HandleFunc("/webhook", handleWebhook)
+	http.HandleFunc("/status", statusHandler)
+
 	log.Printf("Servidor rodando em http://localhost:%s\n", PORT)
 	log.Fatal(http.ListenAndServe(":"+PORT, nil))
 }
