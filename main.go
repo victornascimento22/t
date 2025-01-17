@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -22,56 +22,85 @@ type ScreenPayload struct {
 const PORT = "8081"
 
 var (
-	fehCmd       *exec.Cmd
-	fehMutex     sync.Mutex
-	currentIndex int
+	imagemagickMutex sync.Mutex
+	currentIndex     int
+	fehCmd           *exec.Cmd
+	fehMutex         sync.Mutex
 )
 
-func showImage(imageData []byte) {
+// initFeh inicia o feh em modo slideshow
+func initFeh() error {
 	fehMutex.Lock()
 	defer fehMutex.Unlock()
 
-	if fehCmd != nil && fehCmd.Process != nil {
-		fehCmd.Process.Kill()
-		fehCmd.Wait()
-	}
+	// Mata qualquer instância existente do feh
+	exec.Command("pkill", "feh").Run()
 
-	pr, pw := io.Pipe()
-
+	// Inicia o feh em modo slideshow
 	fehCmd = exec.Command("feh",
-		"-F",
-		"--hide-pointer",
-		"--force-aliasing",
-		"--zoom", "fill",
-		"--high-quality",
-		"--scale-down",
-		"--conversion-timeout", "10",
-		"--draw-tinted",
-		"-d",
-		"-",
-		"no-info",
+		"-R", "1", // Recarrega a cada 1 segundo
+		"-F",      // Modo tela cheia
+		"-Z",      // Zoom automático
+		"-D", "5", // Delay padrão de 5 segundos
+		"-Y", // Esconde o cursor do mouse
+		"./", // Diretório atual
 	)
 
-	fehCmd.Stdin = pr
-	fehCmd.Env = append(os.Environ(), "DISPLAY=:0")
-
-	var stderr bytes.Buffer
-	fehCmd.Stderr = &stderr
-
 	if err := fehCmd.Start(); err != nil {
-		log.Printf("Erro ao iniciar feh: %v\nErro: %s", err, stderr.String())
-		return
+		return fmt.Errorf("erro ao iniciar feh: %v", err)
 	}
 
-	go func() {
-		_, err := pw.Write(imageData)
-		if err != nil {
-			log.Printf("Erro ao escrever imagem no pipe: %v", err)
-		}
-		pw.Close()
-	}()
+	return nil
+}
 
-	log.Printf("Exibindo screenshot (indice: %d)", currentIndex)
+func adjustImage(imageData []byte) ([]byte, error) {
+	imagemagickMutex.Lock()
+	defer imagemagickMutex.Unlock()
+
+	inputFile, err := ioutil.TempFile("", "input-*.png")
+	if err != nil {
+		return nil, fmt.Errorf("erro ao criar arquivo temporário de entrada: %v", err)
+	}
+	defer os.Remove(inputFile.Name())
+
+	outputFile, err := ioutil.TempFile("", "output-*.png")
+	if err != nil {
+		return nil, fmt.Errorf("erro ao criar arquivo temporário de saída: %v", err)
+	}
+	defer os.Remove(outputFile.Name())
+
+	if _, err := inputFile.Write(imageData); err != nil {
+		return nil, fmt.Errorf("erro ao escrever imagem no arquivo de entrada: %v", err)
+	}
+	inputFile.Close()
+
+	// Comando atualizado para remover bordas brancas e ajustar a imagem
+	cmd := exec.Command("convert",
+		inputFile.Name(),
+		"-trim",                // Remove as bordas brancas
+		"+repage",              // Redefine as coordenadas da imagem após o trim
+		"-background", "black", // Define fundo preto
+		"-gravity", "center", // Centraliza a imagem
+		"-resize", "1920x1080^", // Redimensiona cobrindo a área mínima
+		"-extent", "1920x1080", // Força o tamanho exato
+		"-flatten",          // Achata todas as camadas
+		"-compress", "JPEG", // Usa compressão JPEG
+		"-quality", "100", // Máxima qualidade
+		outputFile.Name(),
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("erro ao executar ImageMagick: %v\n%s", err, stderr.String())
+	}
+
+	adjustedImage, err := ioutil.ReadFile(outputFile.Name())
+	if err != nil {
+		return nil, fmt.Errorf("erro ao ler imagem ajustada: %v", err)
+	}
+
+	return adjustedImage, nil
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -97,13 +126,32 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentIndex = payload.Index
-	showImage(imageBytes)
 
+	adjustedImage, err := adjustImage(imageBytes)
+	if err != nil {
+		log.Printf("Erro ao ajustar imagem: %v", err)
+		http.Error(w, "Erro ao ajustar imagem", http.StatusInternalServerError)
+		return
+	}
+
+	outputPath := fmt.Sprintf("output-%d.png", payload.Index)
+	if err := ioutil.WriteFile(outputPath, adjustedImage, 0644); err != nil {
+		log.Printf("Erro ao salvar imagem ajustada: %v", err)
+		http.Error(w, "Erro ao salvar imagem ajustada", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Imagem ajustada salva em: %s", outputPath)
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Screenshot %d recebida e exibida com sucesso", payload.Index)
+	fmt.Fprintf(w, "Screenshot %d recebida, ajustada e salva com sucesso", payload.Index)
 }
 
 func main() {
+	// Inicia o feh antes de começar o servidor
+	if err := initFeh(); err != nil {
+		log.Fatal(err)
+	}
+
 	http.HandleFunc("/webhook", handleWebhook)
 	log.Printf("Servidor rodando em http://localhost:%s\n", PORT)
 	log.Fatal(http.ListenAndServe(":"+PORT, nil))
